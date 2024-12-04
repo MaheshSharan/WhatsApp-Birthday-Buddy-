@@ -1,21 +1,18 @@
-const {
-    default: makeWASocket,
-    useMultiFileAuthState,
-    Browsers,
-    DisconnectReason
-} = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, Browsers, DisconnectReason } = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
 const path = require('path');
 const fs = require('fs');
 const express = require('express');
 const qrcode = require('qrcode');
 const logger = require('pino')();
+const MessageHandler = require('./messageHandler');
 
 class WhatsAppConnection {
     constructor() {
         this.sock = null;
         this.qr = null;
         this.isConnected = false;
+        this.messageHandler = new MessageHandler();
         this.authPath = process.env.NODE_ENV === 'production' 
             ? path.join('/opt/render/project/src/', 'auth_info_baileys')
             : path.join(__dirname, '..', '..', 'auth_info_baileys');
@@ -70,6 +67,9 @@ class WhatsAppConnection {
                 logger: logger
             });
 
+            // Set socket in message handler
+            this.messageHandler.setSocket(this.sock);
+
             // Handle QR code for production
             if (process.env.NODE_ENV === 'production') {
                 this.sock.ev.on('connection.update', ({ qr }) => {
@@ -82,6 +82,19 @@ class WhatsAppConnection {
 
             this.sock.ev.on('creds.update', saveCreds);
             this.sock.ev.on('connection.update', (update) => this.handleConnectionUpdate(update));
+
+            // Handle messages
+            this.sock.ev.on('messages.upsert', async ({ messages, type }) => {
+                if (type === 'notify') {
+                    for (const message of messages) {
+                        try {
+                            await this.messageHandler.handleMessage(message);
+                        } catch (error) {
+                            console.error('Error in message handler:', error);
+                        }
+                    }
+                }
+            });
             
             return this.sock;
         } catch (error) {
@@ -105,6 +118,11 @@ class WhatsAppConnection {
             this.isConnected = true;
             this.qr = null; // Clear QR code after successful connection
         }
+    }
+
+    async sendMessage(jid, content) {
+        if (!this.sock) throw new Error('WhatsApp is not connected');
+        return await this.sock.sendMessage(jid, content);
     }
 }
 
