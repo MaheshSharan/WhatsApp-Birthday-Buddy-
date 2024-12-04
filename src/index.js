@@ -1,13 +1,22 @@
 require('dotenv').config();
 const WhatsAppConnection = require('./whatsapp/connection');
+const messageHandler = require('./whatsapp/messageHandler');
+const BirthdayService = require('./services/birthdayService');
+const db = require('./database/db');
 const cron = require('node-cron');
 const { scheduleBirthdayJob } = require('./cron/birthdayJob');
+
+let birthdayService;
 
 async function startBot() {
     try {
         // Connect to WhatsApp
         const whatsappConnection = new WhatsAppConnection();
         const sock = await whatsappConnection.connect();
+
+        // Initialize birthday service
+        birthdayService = new BirthdayService(whatsappConnection);
+        birthdayService.initializeScheduler();
 
         // Schedule birthday check job
         cron.schedule('0 0 * * *', () => scheduleBirthdayJob(sock));
@@ -29,8 +38,31 @@ async function startBot() {
 
 // Handle process termination
 process.on('SIGINT', async () => {
-    console.log('Shutting down gracefully...');
-    process.exit(0);
+    try {
+        if (birthdayService) {
+            birthdayService.stopScheduler();
+        }
+        await db.close();
+        console.log('Bot shutdown complete');
+        process.exit(0);
+    } catch (error) {
+        console.error('Error during shutdown:', error);
+        process.exit(1);
+    }
+});
+
+// Handle uncaught exceptions
+process.on('uncaughtException', async (error) => {
+    console.error('Uncaught Exception:', error);
+    try {
+        if (birthdayService) {
+            birthdayService.stopScheduler();
+        }
+        await db.close();
+    } catch (err) {
+        console.error('Error during emergency shutdown:', err);
+    }
+    process.exit(1);
 });
 
 // Start the bot

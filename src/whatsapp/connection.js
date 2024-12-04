@@ -5,14 +5,14 @@ const fs = require('fs');
 const express = require('express');
 const qrcode = require('qrcode');
 const logger = require('pino')();
-const MessageHandler = require('./messageHandler');
+const messageHandler = require('./messageHandler');
 
 class WhatsAppConnection {
     constructor() {
         this.sock = null;
         this.qr = null;
         this.isConnected = false;
-        this.messageHandler = new MessageHandler();
+        this.messageHandler = messageHandler;
         this.authPath = process.env.NODE_ENV === 'production' 
             ? path.join('/opt/render/project/src/', 'auth_info_baileys')
             : path.join(__dirname, '..', '..', 'auth_info_baileys');
@@ -52,7 +52,7 @@ class WhatsAppConnection {
         });
 
         app.listen(port, () => {
-            console.log(`Server running on port ${port}. Visit /qr to scan QR code.`);
+            console.log(`Server is running on port ${port}`);
         });
     }
 
@@ -60,69 +60,65 @@ class WhatsAppConnection {
         try {
             const { state, saveCreds } = await useMultiFileAuthState(this.authPath);
             
-            this.sock = makeWASocket({
+            const sock = makeWASocket({
                 auth: state,
                 printQRInTerminal: process.env.NODE_ENV !== 'production',
                 browser: Browsers.ubuntu('Chrome'),
-                logger: logger
+                logger
             });
 
-            // Set socket in message handler
-            this.messageHandler.setSocket(this.sock);
+            this.sock = sock;
+            this.messageHandler.sock = sock;
 
-            // Handle QR code for production
-            if (process.env.NODE_ENV === 'production') {
-                this.sock.ev.on('connection.update', ({ qr }) => {
-                    if (qr) {
-                        this.qr = qr;
-                        console.log('New QR code generated. Visit /qr to scan.');
+            // Handle connection updates
+            sock.ev.on('connection.update', async (update) => {
+                const { connection, lastDisconnect, qr } = update;
+
+                if (qr) {
+                    this.qr = qr;
+                    console.log('QR Code received. Scan it to authenticate!');
+                }
+
+                if (connection === 'close') {
+                    const shouldReconnect = (lastDisconnect?.error instanceof Boom)?.output?.statusCode !== DisconnectReason.loggedOut;
+                    console.log('Connection closed due to ', lastDisconnect?.error, ', reconnecting ', shouldReconnect);
+                    
+                    if (shouldReconnect) {
+                        await this.connect();
                     }
-                });
-            }
-
-            this.sock.ev.on('creds.update', saveCreds);
-            this.sock.ev.on('connection.update', (update) => this.handleConnectionUpdate(update));
+                } else if (connection === 'open') {
+                    console.log('Connected successfully!');
+                    this.isConnected = true;
+                    this.qr = null;
+                }
+            });
 
             // Handle messages
-            this.sock.ev.on('messages.upsert', async ({ messages, type }) => {
+            sock.ev.on('messages.upsert', async ({ messages, type }) => {
                 if (type === 'notify') {
                     for (const message of messages) {
-                        try {
-                            await this.messageHandler.handleMessage(message);
-                        } catch (error) {
-                            console.error('Error in message handler:', error);
-                        }
+                        await this.messageHandler.handleMessage(message);
                     }
                 }
             });
-            
-            return this.sock;
+
+            // Handle credentials update
+            sock.ev.on('creds.update', saveCreds);
+
+            return sock;
         } catch (error) {
             console.error('Error in connect:', error);
             throw error;
         }
     }
 
-    handleConnectionUpdate(update) {
-        const { connection, lastDisconnect } = update;
-        
-        if (connection === 'close') {
-            const shouldReconnect = (lastDisconnect?.error instanceof Boom)?.output?.statusCode !== DisconnectReason.loggedOut;
-            console.log('Connection closed due to:', lastDisconnect?.error, '\nReconnecting:', shouldReconnect);
-            
-            if (shouldReconnect) {
-                this.connect();
-            }
-        } else if (connection === 'open') {
-            console.log('Connected successfully!');
-            this.isConnected = true;
-            this.qr = null; // Clear QR code after successful connection
-        }
-    }
-
     async sendMessage(jid, content) {
-        if (!this.sock) throw new Error('WhatsApp is not connected');
-        return await this.sock.sendMessage(jid, content);
+        try {
+            await this.sock.sendMessage(jid, content);
+        } catch (error) {
+            console.error('Error sending message:', error);
+            throw error;
+        }
     }
 }
 
