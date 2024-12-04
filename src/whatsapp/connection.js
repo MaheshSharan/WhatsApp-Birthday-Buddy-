@@ -70,42 +70,43 @@ class WhatsAppConnection {
             this.sock = sock;
             this.messageHandler.sock = sock;
 
-            // Handle connection updates
-            sock.ev.on('connection.update', async (update) => {
-                const { connection, lastDisconnect, qr } = update;
+            return new Promise((resolve, reject) => {
+                // Handle connection updates
+                sock.ev.on('connection.update', async (update) => {
+                    const { connection, lastDisconnect, qr } = update;
 
-                if (qr) {
-                    this.qr = qr;
-                    console.log('QR Code received. Scan it to authenticate!');
-                }
-
-                if (connection === 'close') {
-                    const shouldReconnect = (lastDisconnect?.error instanceof Boom)?.output?.statusCode !== DisconnectReason.loggedOut;
-                    console.log('Connection closed due to ', lastDisconnect?.error, ', reconnecting ', shouldReconnect);
-                    
-                    if (shouldReconnect) {
-                        await this.connect();
+                    if (qr) {
+                        this.qr = qr;
+                        console.log('QR Code received. Scan it to authenticate!');
                     }
-                } else if (connection === 'open') {
-                    console.log('Connected successfully!');
-                    this.isConnected = true;
-                    this.qr = null;
-                }
-            });
 
-            // Handle messages
-            sock.ev.on('messages.upsert', async ({ messages, type }) => {
-                if (type === 'notify') {
-                    for (const message of messages) {
-                        await this.messageHandler.handleMessage(message);
+                    if (connection === 'close') {
+                        const shouldReconnect = (lastDisconnect?.error instanceof Boom)?.output?.statusCode !== DisconnectReason.loggedOut;
+                        console.log('Connection closed due to ', lastDisconnect?.error, ', reconnecting ', shouldReconnect);
+                        
+                        if (shouldReconnect) {
+                            await this.connect();
+                        }
+                    } else if (connection === 'open') {
+                        console.log('Connected successfully!');
+                        this.isConnected = true;
+                        this.qr = null;
+                        resolve(sock); // Resolve the promise when connection is open
                     }
-                }
+                });
+
+                // Handle messages
+                sock.ev.on('messages.upsert', async ({ messages, type }) => {
+                    if (type === 'notify') {
+                        for (const message of messages) {
+                            await this.messageHandler.handleMessage(message);
+                        }
+                    }
+                });
+
+                // Handle credentials update
+                sock.ev.on('creds.update', saveCreds);
             });
-
-            // Handle credentials update
-            sock.ev.on('creds.update', saveCreds);
-
-            return sock;
         } catch (error) {
             console.error('Error in connect:', error);
             throw error;
@@ -113,6 +114,9 @@ class WhatsAppConnection {
     }
 
     async sendMessage(jid, content) {
+        if (!this.isConnected || !this.sock) {
+            throw new Error('WhatsApp is not connected');
+        }
         try {
             await this.sock.sendMessage(jid, content);
         } catch (error) {
