@@ -4,7 +4,7 @@ const path = require('path');
 const fs = require('fs');
 const express = require('express');
 const qrcode = require('qrcode');
-const logger = require('pino')();
+const logger = require('pino')({ level: process.env.NODE_ENV === 'production' ? 'warn' : 'info' });
 const messageHandler = require('./messageHandler');
 
 class WhatsAppConnection {
@@ -64,13 +64,20 @@ class WhatsAppConnection {
                 auth: state,
                 printQRInTerminal: process.env.NODE_ENV !== 'production',
                 browser: Browsers.ubuntu('Chrome'),
-                logger
+                logger,
+                syncFullHistory: true
             });
 
             this.sock = sock;
             this.messageHandler.sock = sock;
 
             return new Promise((resolve, reject) => {
+                let connectionTimeout = setTimeout(() => {
+                    if (!this.isConnected) {
+                        reject(new Error('Connection timeout after 60 seconds'));
+                    }
+                }, 60000);
+
                 // Handle connection updates
                 sock.ev.on('connection.update', async (update) => {
                     const { connection, lastDisconnect, qr } = update;
@@ -82,16 +89,17 @@ class WhatsAppConnection {
 
                     if (connection === 'close') {
                         const shouldReconnect = (lastDisconnect?.error instanceof Boom)?.output?.statusCode !== DisconnectReason.loggedOut;
-                        console.log('Connection closed due to ', lastDisconnect?.error, ', reconnecting ', shouldReconnect);
+                        console.log('Connection closed due to ', lastDisconnect?.error?.message || 'unknown reason', ', reconnecting ', shouldReconnect);
                         
                         if (shouldReconnect) {
                             await this.connect();
                         }
                     } else if (connection === 'open') {
+                        clearTimeout(connectionTimeout);
                         console.log('Connected successfully!');
                         this.isConnected = true;
                         this.qr = null;
-                        resolve(sock); // Resolve the promise when connection is open
+                        resolve(sock);
                     }
                 });
 
@@ -99,7 +107,11 @@ class WhatsAppConnection {
                 sock.ev.on('messages.upsert', async ({ messages, type }) => {
                     if (type === 'notify') {
                         for (const message of messages) {
-                            await this.messageHandler.handleMessage(message);
+                            try {
+                                await this.messageHandler.handleMessage(message);
+                            } catch (error) {
+                                console.error('Error handling message:', error);
+                            }
                         }
                     }
                 });

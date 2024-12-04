@@ -13,7 +13,8 @@ class MessageHandler {
             ['listBD', this.handleListBirthdays.bind(this)],
             ['AFK', this.handleAfkEnable.bind(this)],
             ['AFKOFF', this.handleAfkDisable.bind(this)],
-            ['status', this.handleStatus.bind(this)]
+            ['status', this.handleStatus.bind(this)],
+            ['test', this.handleTest.bind(this)]
         ]);
         this.ownerNumber = process.env.OWNER_NUMBER || '';
         this.db = new db();
@@ -478,6 +479,13 @@ class MessageHandler {
                 text: `❌ Error: ${error.message}`
             });
         }
+    }
+
+    async handleTest(message) {
+        const chat = message.key.remoteJid;
+        await this.sock.sendMessage(chat, { 
+            text: '🤖 Bot is working! Your message was received.\n\nAvailable commands:\n- @smartbot addBD.Name,DD/MM/YYYY,+PhoneNumber\n- @smartbot removeBD.+PhoneNumber\n- @smartbot listBD\n- @smartbot status' 
+        });
     }
 
     // Get formatted uptime
