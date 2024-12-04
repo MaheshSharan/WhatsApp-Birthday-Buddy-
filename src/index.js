@@ -1,7 +1,9 @@
-const whatsapp = require('./whatsapp/connection');
+require('dotenv').config();
+const WhatsAppConnection = require('./whatsapp/connection');
 const messageHandler = require('./whatsapp/messageHandler');
 const BirthdayService = require('./services/birthdayService');
 const db = require('./database/db');
+const cron = require('node-cron');
 const { scheduleBirthdayJob } = require('./cron/birthdayJob');
 
 let birthdayService;
@@ -10,23 +12,24 @@ let birthdayService;
 async function startBot() {
     try {
         // Connect to WhatsApp
-        await whatsapp.connect();
+        const whatsappConnection = new WhatsAppConnection();
+        const sock = await whatsappConnection.connect();
 
         // Initialize birthday service
-        birthdayService = new BirthdayService(whatsapp);
+        birthdayService = new BirthdayService(whatsappConnection);
         birthdayService.initializeScheduler();
 
-        // Initialize birthday cron job
-        scheduleBirthdayJob();
+        // Schedule birthday check job
+        cron.schedule('0 0 * * *', () => scheduleBirthdayJob(sock));
 
         // Add message handler
-        whatsapp.addMessageHandler(messageHandler.handleMessage.bind(messageHandler));
+        whatsappConnection.addMessageHandler(messageHandler.handleMessage.bind(messageHandler));
 
         console.log('WhatsApp Birthday Bot started successfully!');
         
         // Send startup notification
         if (process.env.ADMIN_NUMBER) {
-            await whatsapp.sendTextMessage(
+            await whatsappConnection.sendTextMessage(
                 process.env.ADMIN_NUMBER,
                 '🤖 WhatsApp Birthday Bot is now online! 🎉'
             );

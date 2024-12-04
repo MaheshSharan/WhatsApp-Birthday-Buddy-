@@ -16,16 +16,17 @@ class MessageHandler {
             ['status', this.handleStatus.bind(this)]
         ]);
         this.ownerNumber = process.env.OWNER_NUMBER || '';
+        this.db = new db();
         this.initStartTime();
     }
 
     async initStartTime() {
         try {
             // Try to get existing start time
-            const startTime = await db.getStartTime();
+            const startTime = await this.db.getStartTime();
             if (!startTime) {
                 // If no start time exists, set it
-                await db.setStartTime(Date.now());
+                await this.db.setStartTime(Date.now());
             }
         } catch (error) {
             console.error('Error initializing start time:', error);
@@ -84,9 +85,9 @@ class MessageHandler {
 
             // If sender is owner and not a command, disable AFK
             if (senderNumber === this.ownerNumber && !messageText.startsWith('@smartbot')) {
-                const wasAfk = await db.isAfk();
+                const wasAfk = await this.db.isAfk();
                 if (wasAfk) {
-                    await db.disableAfk();
+                    await this.db.disableAfk();
                     // Notify only in owner's chat
                     await this.sock.sendMessage(this.ownerNumber + '@s.whatsapp.net', {
                         text: '🌅 AFK mode automatically disabled.'
@@ -97,7 +98,7 @@ class MessageHandler {
 
             // Check if owner is AFK and this is not the owner
             if (senderNumber !== this.ownerNumber) {
-                const ownerAfk = await db.isAfk();
+                const ownerAfk = await this.db.isAfk();
                 if (ownerAfk) {
                     // Don't reply to business/promotional messages
                     if (message.key.remoteJid.includes('business') || 
@@ -235,7 +236,7 @@ class MessageHandler {
                 return;
             }
 
-            await db.addBirthday(name, birthDate, phoneNumber);
+            await this.db.addBirthday(name, birthDate, phoneNumber);
             
             // Calculate days until next birthday
             const today = new Date();
@@ -276,7 +277,7 @@ class MessageHandler {
             const [phoneNumber] = args;
             const formattedPhone = formatPhoneNumber(phoneNumber);
 
-            await db.removeBirthday(formattedPhone);
+            await this.db.removeBirthday(formattedPhone);
             
             await this.sock.sendMessage(message.key.remoteJid, {
                 text: `✅ Birthday removed successfully for ${formattedPhone}`
@@ -296,7 +297,7 @@ class MessageHandler {
             const formattedPhone = formatPhoneNumber(phoneNumber);
             const formattedDate = formatDate(birthDate);
 
-            await db.updateBirthday(name, formattedDate, formattedPhone);
+            await this.db.updateBirthday(name, formattedDate, formattedPhone);
             
             await this.sock.sendMessage(message.key.remoteJid, {
                 text: `✅ Birthday updated successfully!\nName: ${name}\nDate: ${formattedDate}\nPhone: ${formattedPhone}`
@@ -312,7 +313,7 @@ class MessageHandler {
         if (!message?.key?.remoteJid) return;
         
         try {
-            const birthdays = await db.listBirthdays();
+            const birthdays = await this.db.listBirthdays();
             
             if (!birthdays || birthdays.length === 0) {
                 await this.sock.sendMessage(message.key.remoteJid, {
@@ -353,7 +354,7 @@ class MessageHandler {
         
         try {
             const [searchTerm] = args;
-            const results = await db.searchBirthday(searchTerm);
+            const results = await this.db.searchBirthday(searchTerm);
             
             if (results.length === 0) {
                 await this.sock.sendMessage(message.key.remoteJid, {
@@ -436,7 +437,7 @@ class MessageHandler {
                 return;
             }
 
-            await db.setAfk();
+            await this.db.setAfk();
             await this.sock.sendMessage(message.key.remoteJid, {
                 edit: message.key,
                 text: '🌙 AFK mode enabled. I will respond to messages on your behalf.'
@@ -465,7 +466,7 @@ class MessageHandler {
                 return;
             }
 
-            await db.disableAfk();
+            await this.db.disableAfk();
             await this.sock.sendMessage(message.key.remoteJid, {
                 edit: message.key,
                 text: '🌅 AFK mode disabled. Welcome back!'
@@ -482,7 +483,7 @@ class MessageHandler {
     // Get formatted uptime
     async getUptime() {
         try {
-            const startTime = await db.getStartTime();
+            const startTime = await this.db.getStartTime();
             if (!startTime) return '0m'; // Fallback if no start time
 
             const uptime = Date.now() - startTime;
@@ -517,10 +518,10 @@ class MessageHandler {
 
         try {
             // Get birthday statistics
-            const stats = await db.getBirthdayStats();
+            const stats = await this.db.getBirthdayStats();
             
             // Get AFK status
-            const afkStatus = await db.isAfk();
+            const afkStatus = await this.db.isAfk();
             
             // Format month distribution
             const monthDistribution = stats.byMonth
