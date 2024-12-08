@@ -1,41 +1,37 @@
-require('dotenv').config();
-const WhatsAppConnection = require('./whatsapp/connection');
+const whatsapp = require('./whatsapp/connection');
 const messageHandler = require('./whatsapp/messageHandler');
 const BirthdayService = require('./services/birthdayService');
 const db = require('./database/db');
-const cron = require('node-cron');
 const { scheduleBirthdayJob } = require('./cron/birthdayJob');
 
 let birthdayService;
-let whatsappConnection;
 
+// Start WhatsApp connection
 async function startBot() {
     try {
         // Connect to WhatsApp
-        whatsappConnection = new WhatsAppConnection();
-        await whatsappConnection.connect(); // Wait for full connection
+        await whatsapp.connect();
 
         // Initialize birthday service
-        birthdayService = new BirthdayService(whatsappConnection);
+        birthdayService = new BirthdayService(whatsapp);
         birthdayService.initializeScheduler();
 
-        // Schedule birthday check job
-        cron.schedule('0 0 * * *', () => scheduleBirthdayJob(whatsappConnection.sock));
+        // Initialize birthday cron job
+        scheduleBirthdayJob();
+
+        // Add message handler
+        whatsapp.addMessageHandler(messageHandler.handleMessage.bind(messageHandler));
 
         console.log('WhatsApp Birthday Bot started successfully!');
         
-        // Send startup notification only after connection is established
-        if (process.env.OWNER_NUMBER && whatsappConnection.isConnected) {
-            try {
-                await whatsappConnection.sendMessage(
-                    process.env.OWNER_NUMBER + '@s.whatsapp.net',
-                    { text: '🤖 WhatsApp Birthday Bot is now online! 🎉' }
-                );
-            } catch (error) {
-                console.log('Could not send startup notification:', error.message);
-                // Don't exit the process, as the bot is still working
-            }
+        // Send startup notification
+        if (process.env.ADMIN_NUMBER) {
+            await whatsapp.sendTextMessage(
+                process.env.ADMIN_NUMBER,
+                '🤖 WhatsApp Birthday Bot is now online! 🎉'
+            );
         }
+
     } catch (error) {
         console.error('Error starting bot:', error);
         process.exit(1);

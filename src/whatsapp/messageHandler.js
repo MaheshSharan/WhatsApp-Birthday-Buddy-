@@ -2,7 +2,13 @@ const config = require('../config/config');
 const db = require('../database/db');
 const { formatPhoneNumber, formatDate } = require('../utils/validators');
 const aiService = require('../services/aiService');
+const stickerService = require('../services/stickerService');
 const fs = require('fs').promises;
+const PhoneValidator = require('../utils/phoneValidator');
+const logger = require('../utils/logger');
+const { downloadMediaMessage } = require('@whiskeysockets/baileys');
+const path = require('path');
+const temp = require('temp').track();
 
 class MessageHandler {
     constructor() {
@@ -14,20 +20,20 @@ class MessageHandler {
             ['AFK', this.handleAfkEnable.bind(this)],
             ['AFKOFF', this.handleAfkDisable.bind(this)],
             ['status', this.handleStatus.bind(this)],
-            ['test', this.handleTest.bind(this)]
+            ['!sticker', this.handleSticker.bind(this)],
+            ['!s', this.handleSticker.bind(this)]  // Added shorthand command
         ]);
         this.ownerNumber = process.env.OWNER_NUMBER || '';
-        this.db = new db();
         this.initStartTime();
     }
 
     async initStartTime() {
         try {
             // Try to get existing start time
-            const startTime = await this.db.getStartTime();
+            const startTime = await db.getStartTime();
             if (!startTime) {
                 // If no start time exists, set it
-                await this.db.setStartTime(Date.now());
+                await db.setStartTime(Date.now());
             }
         } catch (error) {
             console.error('Error initializing start time:', error);
@@ -51,25 +57,58 @@ class MessageHandler {
 
     async handleMessage(message) {
         try {
-            if (!this.sock) {
-                console.error('Socket not initialized in MessageHandler');
-                return;
-            }
+            if (!this.sock || !message || !message.message) return;
 
-            if (!message || !message.message) return;
-
-            // Extract the message content
             const messageContent = message.message?.conversation || 
                                  message.message?.extendedTextMessage?.text || 
                                  message.message?.imageMessage?.caption || '';
-
+            
             if (!messageContent) return;
 
-            // Get the remote JID (sender's ID)
             const remoteJid = message.key?.remoteJid;
             if (!remoteJid) return;
 
-            const senderNumber = message.key.remoteJid.split('@')[0];
+            const senderNumber = remoteJid.split('@')[0];
+            
+            // Validate phone number
+            if (!PhoneValidator.isValidWhatsAppNumber(senderNumber)) {
+                await logger.logSuspiciousNumber(senderNumber, messageContent);
+                return;
+            }
+
+            // Check for suspicious patterns
+            if (PhoneValidator.isSuspiciousNumber(senderNumber)) {
+                await logger.logSuspiciousNumber(senderNumber, messageContent, {
+                    reason: 'SUSPICIOUS_PATTERN'
+                });
+                return;
+            }
+
+            // Handle AFK for owner
+            if (senderNumber === this.ownerNumber && !messageContent.startsWith('@smartbot')) {
+                const wasAfk = await db.isAfk();
+                if (wasAfk) {
+                    await db.disableAfk();
+                    // Send notification to owner's personal chat
+                    const ownerChat = this.ownerNumber + '@s.whatsapp.net';
+                    await this.sock.sendMessage(ownerChat, {
+                        text: '🌅 AFK mode automatically disabled.'
+                    });
+                }
+                return;
+            }
+
+            // Handle AFK responses for others
+            if (senderNumber !== this.ownerNumber) {
+                const ownerAfk = await db.isAfk();
+                if (ownerAfk && !this.isPromotionalMessage(messageContent)) {
+                    await this.sock.sendMessage(remoteJid, {
+                        text: '🌙 Master is AFK, I will make sure your message reaches them.'
+                    });
+                }
+            }
+
+            // Extract the message content
             const messageText = message.message?.conversation || message.message?.extendedTextMessage?.text || '';
             
             // Check if this is a command
@@ -79,16 +118,34 @@ class MessageHandler {
                 
                 if (handler) {
                     console.log('Found birthday command handler');
-                    await handler(message, args);
+                    try {
+                        // Handle CSV file import specially
+                        if (command === config.bot.commands.importBirthdays.toLowerCase()) {
+                            await this.sock.sendMessage(message.key.remoteJid, {
+                                text: '📝 To import birthdays:\n' +
+                                     '1. Create a CSV file with columns: name, birthdate, phone\n' +
+                                     '2. Send the CSV file\n' +
+                                     '3. Reply to the CSV file with "@smartbot importBD"'
+                            });
+                            return;
+                        }
+
+                        await handler(message, args);
+                    } catch (error) {
+                        console.error('Command error:', error);
+                        await this.sock.sendMessage(message.key.remoteJid, {
+                            text: `❌ Error: ${error.message}`
+                        });
+                    }
                     return;
                 }
             }
 
             // If sender is owner and not a command, disable AFK
             if (senderNumber === this.ownerNumber && !messageText.startsWith('@smartbot')) {
-                const wasAfk = await this.db.isAfk();
+                const wasAfk = await db.isAfk();
                 if (wasAfk) {
-                    await this.db.disableAfk();
+                    await db.disableAfk();
                     // Notify only in owner's chat
                     await this.sock.sendMessage(this.ownerNumber + '@s.whatsapp.net', {
                         text: '🌅 AFK mode automatically disabled.'
@@ -99,7 +156,7 @@ class MessageHandler {
 
             // Check if owner is AFK and this is not the owner
             if (senderNumber !== this.ownerNumber) {
-                const ownerAfk = await this.db.isAfk();
+                const ownerAfk = await db.isAfk();
                 if (ownerAfk) {
                     // Don't reply to business/promotional messages
                     if (message.key.remoteJid.includes('business') || 
@@ -126,7 +183,7 @@ class MessageHandler {
 
                 // Extract command and arguments
                 const fullCommand = messageContent.slice(config.bot.prefix.length).trim();
-                const [commandName, ...args] = fullCommand.split(/[.,]/).map(part => part.trim());
+                const [commandName, ...args] = fullCommand.split(/[\s.,]/).map(part => part.trim()).filter(Boolean);
                 const lowerCommandName = commandName.toLowerCase();
                 
                 console.log('Processing command:', lowerCommandName); // Debug log
@@ -139,7 +196,7 @@ class MessageHandler {
                     try {
                         // Handle CSV file import specially
                         if (lowerCommandName === config.bot.commands.importBirthdays.toLowerCase()) {
-                            await this.sock.sendMessage(remoteJid, {
+                            await this.sock.sendMessage(message.key.remoteJid, {
                                 text: '📝 To import birthdays:\n' +
                                      '1. Create a CSV file with columns: name, birthdate, phone\n' +
                                      '2. Send the CSV file\n' +
@@ -148,17 +205,14 @@ class MessageHandler {
                             return;
                         }
 
-                        // Execute the birthday command
                         await handler(message, args);
                     } catch (error) {
-                        console.error('Birthday command error:', error);
-                        await this.sock.sendMessage(remoteJid, {
+                        console.error('Command error:', error);
+                        await this.sock.sendMessage(message.key.remoteJid, {
                             text: `❌ Error: ${error.message}`
                         });
                     }
                     return;
-                } else {
-                    console.log('No birthday command handler found, treating as AI query'); // Debug log
                 }
 
                 // If not a birthday command, handle as AI query
@@ -178,6 +232,12 @@ class MessageHandler {
                     text: response,
                     quoted: quotedMessage ? message.message.extendedTextMessage.contextInfo : undefined
                 });
+            }
+
+            // First check if it's a sticker command (before AI response)
+            if (messageContent && (messageContent.toLowerCase().includes('!sticker') || messageContent.toLowerCase().includes('!s'))) {
+                await this.handleStickerCommand(message);
+                return;
             }
         } catch (error) {
             console.error('Error in message handler:', error);
@@ -237,7 +297,7 @@ class MessageHandler {
                 return;
             }
 
-            await this.db.addBirthday(name, birthDate, phoneNumber);
+            await db.addBirthday(name, birthDate, phoneNumber);
             
             // Calculate days until next birthday
             const today = new Date();
@@ -278,7 +338,7 @@ class MessageHandler {
             const [phoneNumber] = args;
             const formattedPhone = formatPhoneNumber(phoneNumber);
 
-            await this.db.removeBirthday(formattedPhone);
+            await db.removeBirthday(formattedPhone);
             
             await this.sock.sendMessage(message.key.remoteJid, {
                 text: `✅ Birthday removed successfully for ${formattedPhone}`
@@ -298,7 +358,7 @@ class MessageHandler {
             const formattedPhone = formatPhoneNumber(phoneNumber);
             const formattedDate = formatDate(birthDate);
 
-            await this.db.updateBirthday(name, formattedDate, formattedPhone);
+            await db.updateBirthday(name, formattedDate, formattedPhone);
             
             await this.sock.sendMessage(message.key.remoteJid, {
                 text: `✅ Birthday updated successfully!\nName: ${name}\nDate: ${formattedDate}\nPhone: ${formattedPhone}`
@@ -314,7 +374,7 @@ class MessageHandler {
         if (!message?.key?.remoteJid) return;
         
         try {
-            const birthdays = await this.db.listBirthdays();
+            const birthdays = await db.listBirthdays();
             
             if (!birthdays || birthdays.length === 0) {
                 await this.sock.sendMessage(message.key.remoteJid, {
@@ -355,7 +415,7 @@ class MessageHandler {
         
         try {
             const [searchTerm] = args;
-            const results = await this.db.searchBirthday(searchTerm);
+            const results = await db.searchBirthday(searchTerm);
             
             if (results.length === 0) {
                 await this.sock.sendMessage(message.key.remoteJid, {
@@ -423,6 +483,63 @@ class MessageHandler {
         }
     }
 
+    async handleSticker(message, args) {
+        try {
+            if (!message?.key?.remoteJid) return;
+
+            // Get media message
+            const quotedMessage = message.message?.extendedTextMessage?.contextInfo?.quotedMessage;
+            const mediaMessage = message.message?.imageMessage || 
+                               message.message?.videoMessage || 
+                               quotedMessage?.imageMessage ||
+                               quotedMessage?.videoMessage;
+
+            if (!mediaMessage) {
+                await this.sock.sendMessage(message.key.remoteJid, {
+                    text: '❌ Please send an image/video or reply to one with @smartbot !sticker'
+                });
+                return;
+            }
+
+            // Download media
+            const buffer = await downloadMediaMessage(
+                { message: { [mediaMessage.mimetype.includes('image') ? 'imageMessage' : 'videoMessage']: mediaMessage } },
+                'buffer',
+                { }
+            );
+
+            // Create temporary file
+            const tempFile = temp.path({ suffix: mediaMessage.mimetype.includes('image') ? '.png' : '.mp4' });
+            await fs.writeFile(tempFile, buffer);
+
+            // Parse options from command
+            const options = stickerService.parseOptions(args.join(' '));
+
+            // Send processing message
+            await this.sock.sendMessage(message.key.remoteJid, {
+                text: '⚙️ Creating sticker...'
+            });
+
+            // Create sticker
+            const stickerPath = await stickerService.createSticker(tempFile, options);
+
+            // Send sticker
+            await this.sock.sendMessage(message.key.remoteJid, {
+                sticker: await fs.readFile(stickerPath)
+            });
+
+            // Cleanup
+            await fs.unlink(tempFile).catch(console.error);
+            await fs.unlink(stickerPath).catch(console.error);
+
+        } catch (error) {
+            console.error('Sticker creation error:', error);
+            await this.sock.sendMessage(message.key.remoteJid, {
+                text: `❌ Error creating sticker: ${error.message}`
+            });
+        }
+    }
+
     async handleAfkEnable(message) {
         if (!message?.key?.remoteJid) return;
         
@@ -438,7 +555,7 @@ class MessageHandler {
                 return;
             }
 
-            await this.db.setAfk();
+            await db.setAfk();
             await this.sock.sendMessage(message.key.remoteJid, {
                 edit: message.key,
                 text: '🌙 AFK mode enabled. I will respond to messages on your behalf.'
@@ -467,7 +584,7 @@ class MessageHandler {
                 return;
             }
 
-            await this.db.disableAfk();
+            await db.disableAfk();
             await this.sock.sendMessage(message.key.remoteJid, {
                 edit: message.key,
                 text: '🌅 AFK mode disabled. Welcome back!'
@@ -481,17 +598,10 @@ class MessageHandler {
         }
     }
 
-    async handleTest(message) {
-        const chat = message.key.remoteJid;
-        await this.sock.sendMessage(chat, { 
-            text: '🤖 Bot is working! Your message was received.\n\nAvailable commands:\n- @smartbot addBD.Name,DD/MM/YYYY,+PhoneNumber\n- @smartbot removeBD.+PhoneNumber\n- @smartbot listBD\n- @smartbot status' 
-        });
-    }
-
     // Get formatted uptime
     async getUptime() {
         try {
-            const startTime = await this.db.getStartTime();
+            const startTime = await db.getStartTime();
             if (!startTime) return '0m'; // Fallback if no start time
 
             const uptime = Date.now() - startTime;
@@ -526,10 +636,10 @@ class MessageHandler {
 
         try {
             // Get birthday statistics
-            const stats = await this.db.getBirthdayStats();
+            const stats = await db.getBirthdayStats();
             
             // Get AFK status
-            const afkStatus = await this.db.isAfk();
+            const afkStatus = await db.isAfk();
             
             // Format month distribution
             const monthDistribution = stats.byMonth
@@ -558,6 +668,144 @@ class MessageHandler {
                 text: `❌ Error getting status: ${error.message}`
             });
         }
+    }
+
+    isPromotionalMessage(message) {
+        return message.toLowerCase().includes('offer') ||
+               message.toLowerCase().includes('discount') ||
+               message.toLowerCase().includes('sale') ||
+               message.key.remoteJid.includes('business');
+    }
+
+    async handleStickerCommand(message) {
+        if (!message?.key?.remoteJid) return;
+
+        try {
+            const messageContent = message.message?.conversation || 
+                                 message.message?.extendedTextMessage?.text || 
+                                 message.message?.imageMessage?.caption || '';
+
+            // Get quoted message if exists
+            const quotedMsg = message.message?.extendedTextMessage?.contextInfo?.quotedMessage;
+            let mediaMessage = message;
+
+            // Check if it's a reply to a media message
+            if (quotedMsg) {
+                if (quotedMsg.imageMessage || quotedMsg.videoMessage) {
+                    mediaMessage = {
+                        message: quotedMsg,
+                        key: message.message.extendedTextMessage.contextInfo.stanzaId
+                    };
+                }
+            }
+
+            // Check if we have media to process
+            if (!mediaMessage.message?.imageMessage && !mediaMessage.message?.videoMessage) {
+                await this.sock.sendMessage(message.key.remoteJid, {
+                    edit: message.key,
+                    text: 'Please provide an image or video to convert to sticker. You can either:\n1. Reply to a media with !sticker\n2. Send media with !sticker as caption'
+                });
+                return;
+            }
+
+            // Parse options from command
+            const options = this.parseStickerOptions(messageContent);
+
+            // Download media
+            const media = await downloadMediaMessage(
+                mediaMessage,
+                'buffer',
+                {},
+                {
+                    logger: console,
+                    reuploadRequest: this.sock.updateMediaMessage
+                }
+            );
+
+            if (!media) {
+                throw new Error('Failed to download media.');
+            }
+
+            // Create temporary file for processing
+            const tempFile = path.join(temp.mkdirSync('sticker-'), 'temp');
+            await fs.writeFile(tempFile, media);
+
+            // Create sticker
+            const stickerPath = await stickerService.createSticker(tempFile, options);
+
+            // Send the sticker by editing original message
+            await this.sock.sendMessage(message.key.remoteJid, {
+                edit: message.key,
+                sticker: await fs.readFile(stickerPath)
+            });
+
+            // Cleanup
+            await fs.unlink(tempFile).catch(console.error);
+            await fs.unlink(stickerPath).catch(console.error);
+
+        } catch (error) {
+            console.error('Error creating sticker:', error);
+            await this.sock.sendMessage(message.key.remoteJid, {
+                edit: message.key,
+                text: `❌ Error creating sticker: ${error.message}`
+            });
+        }
+    }
+
+    parseStickerOptions(commandText) {
+        const options = {
+            crop: false,
+            circle: false,
+            nobg: false,
+            full: false,
+            quality: this.stickerService.config.defaults.quality,
+            duration: this.stickerService.config.defaults.maxDuration,
+            author: this.stickerService.config.defaults.author,
+            pack: 'WhatsApp Stickers'
+        };
+
+        if (!commandText) return options;
+
+        // Remove !sticker and split remaining text
+        const params = commandText.replace(/!sticker|!s/gi, '').trim().split(/[\s,]+/);
+        
+        params.forEach(param => {
+            // Check for parameter variations
+            const paramLower = param.toLowerCase();
+            
+            // Handle quality=X format
+            if (paramLower.startsWith('quality=')) {
+                const value = parseInt(paramLower.split('=')[1]);
+                if (!isNaN(value) && value >= 1 && value <= 100) {
+                    options.quality = value;
+                }
+                return;
+            }
+
+            // Handle other parameters with fuzzy matching
+            if (this.fuzzyMatch(paramLower, 'nobg')) options.nobg = true;
+            if (this.fuzzyMatch(paramLower, 'circle')) options.circle = true;
+            if (this.fuzzyMatch(paramLower, 'crop')) options.crop = true;
+            if (this.fuzzyMatch(paramLower, 'full')) options.full = true;
+        });
+
+        return options;
+    }
+
+    fuzzyMatch(input, target) {
+        // Simple fuzzy matching - if input is at least 70% similar to target
+        if (!input || !target) return false;
+        
+        const maxDistance = Math.floor(target.length * 0.3); // Allow 30% difference
+        let distance = 0;
+        
+        for (let i = 0; i < input.length && distance <= maxDistance; i++) {
+            if (i >= target.length || input[i] !== target[i]) {
+                distance++;
+            }
+        }
+        
+        return distance <= maxDistance;
     }
 }
 

@@ -1,45 +1,40 @@
 const sqlite3 = require('sqlite3').verbose();
-const path = require('path');
 const fs = require('fs');
-require('dotenv').config();
+const path = require('path');
+const config = require('../config/config');
 
-class Database {
-    constructor() {
-        this.dbPath = process.env.DB_PATH || path.join(__dirname, 'birthday.db');
-        
-        // Ensure database directory exists
-        const dbDir = path.dirname(this.dbPath);
-        if (!fs.existsSync(dbDir)) {
-            fs.mkdirSync(dbDir, { recursive: true });
+// Ensure database directory exists
+const dbDir = path.dirname(config.database.path);
+if (!fs.existsSync(dbDir)) {
+    fs.mkdirSync(dbDir, { recursive: true });
+}
+
+// Create database connection
+const db = new sqlite3.Database(config.database.path, (err) => {
+    if (err) {
+        console.error('Error connecting to database:', err);
+        return;
+    }
+    console.log('Connected to SQLite database');
+    
+    // Initialize database schema
+    const schema = fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf8');
+    db.exec(schema, (err) => {
+        if (err) {
+            console.error('Error initializing database schema:', err);
+            return;
         }
+        console.log('Database schema initialized');
+    });
+});
 
-        this.db = new sqlite3.Database(this.dbPath, (err) => {
-            if (err) {
-                console.error('Error connecting to database:', err);
-                return;
-            }
-            console.log('Connected to SQLite database at:', this.dbPath);
-            this.init();
-        });
-    }
-
-    init() {
-        // Initialize database schema
-        const schema = fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf8');
-        this.db.exec(schema, (err) => {
-            if (err) {
-                console.error('Error initializing database schema:', err);
-                return;
-            }
-            console.log('Database schema initialized');
-        });
-    }
-
-    // Database utility functions
-    addBirthday(name, birthDate, phoneNumber) {
+// Database utility functions
+const dbUtils = {
+    // Add a new birthday
+    addBirthday: (name, birthDate, phoneNumber) => {
         return new Promise((resolve, reject) => {
             const query = `INSERT INTO birthdays (name, birth_date, phone_number) VALUES (?, ?, ?)`;
-            this.db.run(query, [name, birthDate, phoneNumber], function(err) {
+            db.run(query, [name, birthDate, phoneNumber], function(err) {
                 if (err) {
                     reject(err);
                     return;
@@ -47,12 +42,13 @@ class Database {
                 resolve(this.lastID);
             });
         });
-    }
+    },
 
-    removeBirthday(phoneNumber) {
+    // Remove a birthday by phone number
+    removeBirthday: (phoneNumber) => {
         return new Promise((resolve, reject) => {
             const query = `DELETE FROM birthdays WHERE phone_number = ?`;
-            this.db.run(query, [phoneNumber], function(err) {
+            db.run(query, [phoneNumber], function(err) {
                 if (err) {
                     reject(err);
                     return;
@@ -60,12 +56,13 @@ class Database {
                 resolve(this.changes > 0);
             });
         });
-    }
+    },
 
-    updateBirthday(name, birthDate, phoneNumber) {
+    // Update birthday information
+    updateBirthday: (name, birthDate, phoneNumber) => {
         return new Promise((resolve, reject) => {
             const query = `UPDATE birthdays SET name = ?, birth_date = ? WHERE phone_number = ?`;
-            this.db.run(query, [name, birthDate, phoneNumber], function(err) {
+            db.run(query, [name, birthDate, phoneNumber], function(err) {
                 if (err) {
                     reject(err);
                     return;
@@ -73,13 +70,14 @@ class Database {
                 resolve(this.changes > 0);
             });
         });
-    }
+    },
 
-    listBirthdays() {
+    // List all birthdays
+    listBirthdays: () => {
         return new Promise((resolve, reject) => {
             const query = `SELECT * FROM birthdays ORDER BY 
                 strftime('%m-%d', birth_date)`;
-            this.db.all(query, [], (err, rows) => {
+            db.all(query, [], (err, rows) => {
                 if (err) {
                     reject(err);
                     return;
@@ -87,14 +85,15 @@ class Database {
                 resolve(rows);
             });
         });
-    }
+    },
 
-    searchBirthday(search) {
+    // Search birthday by name or phone number
+    searchBirthday: (search) => {
         return new Promise((resolve, reject) => {
             const query = `SELECT * FROM birthdays 
                           WHERE name LIKE ? OR phone_number LIKE ?`;
             const searchPattern = `%${search}%`;
-            this.db.all(query, [searchPattern, searchPattern], (err, rows) => {
+            db.all(query, [searchPattern, searchPattern], (err, rows) => {
                 if (err) {
                     reject(err);
                     return;
@@ -102,15 +101,16 @@ class Database {
                 resolve(rows);
             });
         });
-    }
+    },
 
-    getUpcomingBirthdays(days = 1) {
+    // Get upcoming birthdays
+    getUpcomingBirthdays: (days = 1) => {
         return new Promise((resolve, reject) => {
             const query = `
                 SELECT * FROM birthdays 
                 WHERE strftime('%m-%d', birth_date) = strftime('%m-%d', 'now', '+' || ? || ' days')
                 ORDER BY name`;
-            this.db.all(query, [days], (err, rows) => {
+            db.all(query, [days], (err, rows) => {
                 if (err) {
                     reject(err);
                     return;
@@ -118,9 +118,10 @@ class Database {
                 resolve(rows);
             });
         });
-    }
+    },
 
-    getBirthdayStats() {
+    // Get birthday statistics
+    getBirthdayStats: () => {
         return new Promise((resolve, reject) => {
             const queries = {
                 total: 'SELECT COUNT(*) as count FROM birthdays',
@@ -144,7 +145,7 @@ class Database {
             let completed = 0;
 
             // Get total birthdays
-            this.db.get(queries.total, [], (err, row) => {
+            db.get(queries.total, [], (err, row) => {
                 if (err) {
                     reject(err);
                     return;
@@ -155,7 +156,7 @@ class Database {
             });
 
             // Get birthdays by month
-            this.db.all(queries.byMonth, [], (err, rows) => {
+            db.all(queries.byMonth, [], (err, rows) => {
                 if (err) {
                     reject(err);
                     return;
@@ -166,7 +167,7 @@ class Database {
             });
 
             // Get upcoming birthdays (next 7 days)
-            this.db.get(queries.upcoming, [], (err, row) => {
+            db.get(queries.upcoming, [], (err, row) => {
                 if (err) {
                     reject(err);
                     return;
@@ -176,13 +177,14 @@ class Database {
                 if (completed === 3) resolve(stats);
             });
         });
-    }
+    },
 
-    setAfk() {
+    // AFK related functions
+    setAfk: () => {
         return new Promise((resolve, reject) => {
             const query = `INSERT OR REPLACE INTO afk_status (is_afk, afk_since, last_updated) 
                           VALUES (1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`;
-            this.db.run(query, function(err) {
+            db.run(query, function(err) {
                 if (err) {
                     reject(err);
                     return;
@@ -190,12 +192,12 @@ class Database {
                 resolve(true);
             });
         });
-    }
+    },
 
-    disableAfk() {
+    disableAfk: () => {
         return new Promise((resolve, reject) => {
             const query = `UPDATE afk_status SET is_afk = 0, last_updated = CURRENT_TIMESTAMP`;
-            this.db.run(query, function(err) {
+            db.run(query, function(err) {
                 if (err) {
                     reject(err);
                     return;
@@ -203,12 +205,12 @@ class Database {
                 resolve(true);
             });
         });
-    }
+    },
 
-    isAfk() {
+    isAfk: () => {
         return new Promise((resolve, reject) => {
             const query = `SELECT is_afk, afk_since FROM afk_status WHERE is_afk = 1`;
-            this.db.get(query, [], (err, row) => {
+            db.get(query, [], (err, row) => {
                 if (err) {
                     reject(err);
                     return;
@@ -216,11 +218,12 @@ class Database {
                 resolve(row || null);
             });
         });
-    }
+    },
 
-    getStartTime() {
+    // Bot stats functions
+    getStartTime: () => {
         return new Promise((resolve, reject) => {
-            this.db.get('SELECT value FROM bot_stats WHERE key = ?', ['start_time'], (err, row) => {
+            db.get('SELECT value FROM bot_stats WHERE key = ?', ['start_time'], (err, row) => {
                 if (err) {
                     reject(err);
                     return;
@@ -228,11 +231,11 @@ class Database {
                 resolve(row ? parseInt(row.value) : null);
             });
         });
-    }
+    },
 
-    setStartTime(timestamp) {
+    setStartTime: (timestamp) => {
         return new Promise((resolve, reject) => {
-            this.db.run(
+            db.run(
                 'INSERT OR REPLACE INTO bot_stats (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)',
                 ['start_time', timestamp.toString()],
                 (err) => {
@@ -244,11 +247,12 @@ class Database {
                 }
             );
         });
-    }
+    },
 
-    close() {
+    // Close database connection
+    close: () => {
         return new Promise((resolve, reject) => {
-            this.db.close((err) => {
+            db.close((err) => {
                 if (err) {
                     reject(err);
                     return;
@@ -257,12 +261,11 @@ class Database {
             });
         });
     }
-}
+};
 
 // Handle process termination
 process.on('SIGINT', () => {
-    const db = new Database();
-    db.close()
+    dbUtils.close()
         .then(() => {
             console.log('Database connection closed');
             process.exit(0);
@@ -273,4 +276,4 @@ process.on('SIGINT', () => {
         });
 });
 
-module.exports = Database;
+module.exports = dbUtils;

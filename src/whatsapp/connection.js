@@ -1,141 +1,181 @@
-const { default: makeWASocket, useMultiFileAuthState, Browsers, DisconnectReason } = require('@whiskeysockets/baileys');
+const {
+    default: makeWASocket,
+    useMultiFileAuthState,
+    DisconnectReason,
+    fetchLatestBaileysVersion,
+    makeInMemoryStore,
+    jidDecode
+} = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
 const path = require('path');
 const fs = require('fs');
-const express = require('express');
-const qrcode = require('qrcode');
-const logger = require('pino')({ level: process.env.NODE_ENV === 'production' ? 'warn' : 'info' });
+const pino = require('pino');
+const logger = pino({ level: 'warn' });
 const messageHandler = require('./messageHandler');
+const commandHandler = require('../handlers/commandHandler');
+
+// Create store to handle message history
+const store = makeInMemoryStore({ logger });
+store.readFromFile('./baileys_store.json');
+setInterval(() => {
+    store.writeToFile('./baileys_store.json');
+}, 10000);
 
 class WhatsAppConnection {
     constructor() {
         this.sock = null;
         this.qr = null;
-        this.isConnected = false;
-        this.messageHandler = messageHandler;
-        this.authPath = process.env.NODE_ENV === 'production' 
-            ? path.join('/opt/render/project/src/', 'auth_info_baileys')
-            : path.join(__dirname, '..', '..', 'auth_info_baileys');
-        
-        // Create auth directory if it doesn't exist
-        if (!fs.existsSync(this.authPath)) {
-            fs.mkdirSync(this.authPath, { recursive: true });
-        }
-
-        // Setup express for QR code endpoint
-        if (process.env.NODE_ENV === 'production') {
-            this.setupQREndpoint();
-        }
+        this.authenticated = false;
+        this.messageHandlers = new Set();
+        this.reconnectAttempts = 0;
+        this.maxReconnectAttempts = 5;
     }
 
-    setupQREndpoint() {
-        const app = express();
-        const port = process.env.PORT || 3000;
-
-        app.get('/', (req, res) => {
-            res.send('WhatsApp Bot is running!');
-        });
-
-        app.get('/qr', async (req, res) => {
-            if (this.isConnected) {
-                return res.send('Bot is already connected!');
-            }
-            if (!this.qr) {
-                return res.send('QR Code not generated yet. Please wait and refresh.');
-            }
-            try {
-                const qrImage = await qrcode.toDataURL(this.qr);
-                res.send(`<html><body><h1>Scan QR Code</h1><img src="${qrImage}"></body></html>`);
-            } catch (error) {
-                res.status(500).send('Error generating QR code');
-            }
-        });
-
-        app.listen(port, () => {
-            console.log(`Server is running on port ${port}`);
-        });
-    }
-
+    // Initialize connection
     async connect() {
         try {
-            const { state, saveCreds } = await useMultiFileAuthState(this.authPath);
-            
-            const sock = makeWASocket({
-                auth: state,
-                printQRInTerminal: process.env.NODE_ENV !== 'production',
-                browser: Browsers.ubuntu('Chrome'),
+            const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
+            const { version } = await fetchLatestBaileysVersion();
+
+            // Updated connection configuration
+            this.sock = makeWASocket({
+                version,
                 logger,
-                syncFullHistory: true
+                printQRInTerminal: true,
+                auth: state,
+                browser: ["Chrome (Linux)", "", ""],
+                connectTimeoutMs: 60000,
+                qrTimeout: 60000,
+                defaultQueryTimeoutMs: 60000,
+                keepAliveIntervalMs: 10000,
+                emitOwnEvents: true,
+                markOnlineOnConnect: true,
+                syncFullHistory: false,
+                generateHighQualityLinkPreview: false,
+                getMessage: async () => {
+                    return { conversation: 'hello' };
+                }
             });
 
-            this.sock = sock;
-            this.messageHandler.sock = sock;
+            // Set socket in handlers
+            messageHandler.setSocket(this.sock);
+            commandHandler.setSocket(this.sock);
 
-            return new Promise((resolve, reject) => {
-                let connectionTimeout = setTimeout(() => {
-                    if (!this.isConnected) {
-                        reject(new Error('Connection timeout after 60 seconds'));
-                    }
-                }, 60000);
+            store.bind(this.sock.ev);
 
-                // Handle connection updates
-                sock.ev.on('connection.update', async (update) => {
-                    const { connection, lastDisconnect, qr } = update;
+            // Handle connection updates
+            this.sock.ev.on('connection.update', async (update) => {
+                const { connection, lastDisconnect, qr } = update;
 
-                    if (qr) {
-                        this.qr = qr;
-                        console.log('QR Code received. Scan it to authenticate!');
-                    }
+                if (qr) {
+                    this.qr = qr;
+                    console.log('\n=========================');
+                    console.log('Please scan the QR code above with your WhatsApp mobile app:');
+                    console.log('1. Open WhatsApp on your phone');
+                    console.log('2. Tap Menu or Settings and select Linked Devices');
+                    console.log('3. Tap on "Link a Device"');
+                    console.log('4. Point your phone to this screen to capture the QR code');
+                    console.log('Note: If scanning fails, try these steps:');
+                    console.log('- Make sure you\'re using the latest WhatsApp version');
+                    console.log('- Clear your linked devices and try again');
+                    console.log('- Restart WhatsApp on your phone');
+                    console.log('=========================\n');
+                }
 
-                    if (connection === 'close') {
-                        const shouldReconnect = (lastDisconnect?.error instanceof Boom)?.output?.statusCode !== DisconnectReason.loggedOut;
-                        console.log('Connection closed due to ', lastDisconnect?.error?.message || 'unknown reason', ', reconnecting ', shouldReconnect);
-                        
-                        if (shouldReconnect) {
+                if (connection === 'close') {
+                    const statusCode = (lastDisconnect?.error instanceof Boom)?.output?.statusCode;
+                    const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+                    console.log('Connection closed due to:', lastDisconnect?.error?.output?.payload?.message);
+                    
+                    if (shouldReconnect && this.reconnectAttempts < this.maxReconnectAttempts) {
+                        this.reconnectAttempts++;
+                        console.log(`Reconnecting... Attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts}`);
+                        setTimeout(async () => {
                             await this.connect();
+                        }, 5000);
+                    } else if (statusCode === DisconnectReason.loggedOut) {
+                        // Only clear auth info if logged out
+                        console.log('Logged out from WhatsApp. Clearing auth info...');
+                        if (fs.existsSync('./auth_info_baileys')) {
+                            fs.rmSync('./auth_info_baileys', { recursive: true, force: true });
                         }
-                    } else if (connection === 'open') {
-                        clearTimeout(connectionTimeout);
-                        console.log('Connected successfully!');
-                        this.isConnected = true;
-                        this.qr = null;
-                        resolve(sock);
+                        console.log('Please restart the bot and scan QR code again.');
+                        process.exit(1);
+                    } else {
+                        console.log('Connection closed. Please restart the bot.');
+                        process.exit(1);
                     }
-                });
+                }
 
-                // Handle messages
-                sock.ev.on('messages.upsert', async ({ messages, type }) => {
-                    if (type === 'notify') {
-                        for (const message of messages) {
-                            try {
-                                await this.messageHandler.handleMessage(message);
-                            } catch (error) {
-                                console.error('Error handling message:', error);
-                            }
-                        }
-                    }
-                });
+                if (connection === 'open') {
+                    this.authenticated = true;
+                    this.reconnectAttempts = 0;
+                    console.log('Connected to WhatsApp');
 
-                // Handle credentials update
-                sock.ev.on('creds.update', saveCreds);
+                    // Send connection notification to the user's own number
+                    const userPhoneNumber = this.sock.user.id.split(':')[0];
+                    this.sock.sendMessage(`${userPhoneNumber}@s.whatsapp.net`, {
+                        text: ' Smart Bot is now connected and ready.🎉' 
+                    });
+                }
             });
+
+            // Save credentials on update
+            this.sock.ev.on('creds.update', saveCreds);
+
+            // Handle messages
+            this.sock.ev.on('messages.upsert', async ({ messages, type }) => {
+                if (type === 'notify') {
+                    for (const message of messages) {
+                        try {
+                            await messageHandler.handleMessage(message);
+                        } catch (error) {
+                            console.error('Error in message handler:', error);
+                        }
+                    }
+                }
+            });
+
         } catch (error) {
             console.error('Error in connect:', error);
-            throw error;
+            if (this.reconnectAttempts < this.maxReconnectAttempts) {
+                this.reconnectAttempts++;
+                console.log(`Retrying connection... Attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts}`);
+                setTimeout(async () => {
+                    await this.connect();
+                }, 5000);
+            } else {
+                console.log('Failed to connect after maximum attempts. Please restart the bot.');
+                process.exit(1);
+            }
         }
     }
 
-    async sendMessage(jid, content) {
-        if (!this.isConnected || !this.sock) {
+    // Add message handler
+    addMessageHandler(handler) {
+        this.messageHandlers.add(handler);
+    }
+
+    // Remove message handler
+    removeMessageHandler(handler) {
+        this.messageHandlers.delete(handler);
+    }
+
+    // Send text message
+    async sendTextMessage(to, text) {
+        if (!this.sock || !this.authenticated) {
             throw new Error('WhatsApp is not connected');
         }
         try {
-            await this.sock.sendMessage(jid, content);
+            await this.sock.sendMessage(to, { text });
+            return true;
         } catch (error) {
             console.error('Error sending message:', error);
-            throw error;
+            return false;
         }
     }
 }
 
-module.exports = WhatsAppConnection;
+// Export singleton instance
+const whatsapp = new WhatsAppConnection();
+module.exports = whatsapp;
